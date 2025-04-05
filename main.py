@@ -9,6 +9,9 @@ import time
 from functools import lru_cache
 import logging
 import numpy as np
+import os
+from contextlib import asynccontextmanager
+from fastapi.responses import JSONResponse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -22,10 +25,17 @@ def get_stock_data(ticker: str, period: str = "1d", interval: str = "1h") -> Opt
     """
     try:
         stock = yf.Ticker(ticker)
+        # Validate the ticker exists
+        if not stock or not stock.info:
+            logger.warning(f"Invalid ticker or no info available for {ticker}")
+            return None
+            
+        # Get historical data
         data = stock.history(period=period, interval=interval)
         if data.empty:
             logger.warning(f"No data found for {ticker}")
             return None
+            
         return data
     except Exception as e:
         logger.error(f"Error fetching data for {ticker}: {str(e)}")
@@ -55,21 +65,63 @@ def get_multiple_stocks(tickers: List[str], period: str = "1d", interval: str = 
         logger.error(f"Error fetching multiple stocks: {str(e)}")
         return None
 
-# Initialize FastAPI app
+# Add startup and shutdown events
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting up the application...")
+    try:
+        # Initialize any resources here
+        logger.info("Application startup complete")
+    except Exception as e:
+        logger.error(f"Error during startup: {str(e)}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down the application...")
+    try:
+        # Cleanup resources here
+        logger.info("Application shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {str(e)}")
+
+# Update FastAPI initialization
 app = FastAPI(
     title="Enhanced Financial Data API",
     description="Comprehensive API for stocks, forex, mutual funds, and index funds data",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Enable CORS for frontend requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to your frontend URL for production
+    allow_origins=["*"],  # For production, specify your frontend URL
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
+
+# Add error handling middleware
+@app.middleware("http")
+async def add_error_handling(request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logger.error(f"Unhandled error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error occurred. Please try again later."}
+        )
+
+# Add health check endpoint
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 # Constants for time periods
 TIME_PERIODS = {
@@ -354,6 +406,18 @@ def format_stock_data(data: pd.DataFrame, info: Dict[str, Any]) -> Dict[str, Any
         "AnnualReturn": float(annual_return)
     }
 
+# Helper function to validate stock symbol
+def validate_stock_symbol(symbol: str) -> bool:
+    """
+    Validate if a stock symbol is valid
+    """
+    try:
+        stock = yf.Ticker(symbol)
+        info = stock.info
+        return bool(info and not stock.history(period="1d").empty)
+    except:
+        return False
+
 # ✅ 1️⃣ Root Endpoint (Check if API is running)
 @app.get("/")
 def root():
@@ -380,16 +444,24 @@ def root():
 # ✅ 2️⃣ Search Stocks by Name or Symbol
 @app.get("/search/")
 def search_instruments(
-    query: str, 
-    limit: Optional[int] = Query(10, description="Maximum number of results"),
+    query: str = Query(..., min_length=1, description="Search query"),
+    limit: Optional[int] = Query(10, ge=1, le=50, description="Maximum number of results"),
     type: Optional[str] = Query(None, description="Filter by type: stock, forex, index, mutual_fund")
 ):
     try:
+        if not query:
+            raise HTTPException(status_code=400, detail="Search query cannot be empty")
+            
+        if type and type not in ["stock", "forex", "index", "mutual_fund"]:
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid type. Must be one of: stock, forex, index, mutual_fund"
+            )
+        
         results = []
         
         # Add stock search
         if type is None or type == "stock":
-            # Try to get stock info directly
             try:
                 stock = yf.Ticker(query)
                 info = stock.info
@@ -408,35 +480,63 @@ def search_instruments(
                         "symbol": query,
                         "name": info.get('shortName', 'Unknown'),
                         "exchange": exchange,
-                        "type": "stock"
+                        "type": "stock",
+                        "current_price": info.get('currentPrice', info.get('regularMarketPrice', None)),
+                        "currency": info.get('currency', 'Unknown')
                     })
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error searching stock {query}: {str(e)}")
         
         # Add forex search
         if type is None or type == "forex":
             for key, symbol in FOREX_MAPPING.items():
                 if query.lower() in key or query.lower() in symbol.lower():
-                    results.append({
-                        "symbol": symbol,
-                        "name": symbol.replace("=X", ""),
-                        "type": "forex"
-                    })
+                    try:
+                        forex = yf.Ticker(symbol)
+                        info = forex.info
+                        results.append({
+                            "symbol": symbol,
+                            "name": symbol.replace("=X", ""),
+                            "type": "forex",
+                            "current_rate": info.get('regularMarketPrice', None) if info else None
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error searching forex {symbol}: {str(e)}")
         
         # Add index search
         if type is None or type == "index":
             for key, symbol in INDICES_MAPPING.items():
                 if query.lower() in key or query.lower() in symbol.lower():
-                    results.append({
-                        "symbol": symbol,
-                        "name": key.capitalize(),
-                        "type": "index"
-                    })
+                    try:
+                        index = yf.Ticker(symbol)
+                        info = index.info
+                        results.append({
+                            "symbol": symbol,
+                            "name": key.capitalize(),
+                            "type": "index",
+                            "current_value": info.get('regularMarketPrice', None) if info else None
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error searching index {symbol}: {str(e)}")
         
-        return {"results": results[:limit]}
+        if not results:
+            return {"results": [], "message": f"No results found for '{query}'"}
+            
+        return {
+            "results": results[:limit],
+            "count": len(results[:limit]),
+            "query": query,
+            "type": type
+        }
+        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in search: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error during search")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error during search: {str(e)}"
+        )
 
 # ✅ 3️⃣ Get Stock Data (with exchange support)
 @app.get("/stock/{symbol}")
@@ -447,10 +547,21 @@ def get_stock_data_endpoint(
     exchange: Optional[str] = Query(None, description="Exchange: nse, bse")
 ):
     try:
+        # Validate period and interval
+        if period not in TIME_PERIODS:
+            raise HTTPException(status_code=400, detail=f"Invalid period. Must be one of: {', '.join(TIME_PERIODS.keys())}")
+        
+        if interval not in ["1d", "1wk", "1mo"]:
+            raise HTTPException(status_code=400, detail="Invalid interval. Must be: 1d, 1wk, or 1mo")
+            
         # Add exchange suffix if specified
         if exchange and exchange.lower() in EXCHANGE_MAPPING:
             if not symbol.endswith(EXCHANGE_MAPPING[exchange.lower()]):
                 symbol = symbol + EXCHANGE_MAPPING[exchange.lower()]
+        
+        # Validate symbol
+        if not validate_stock_symbol(symbol):
+            raise HTTPException(status_code=404, detail=f"Invalid stock symbol: {symbol}")
         
         # Get stock info first
         stock = yf.Ticker(symbol)
@@ -469,7 +580,7 @@ def get_stock_data_endpoint(
             raise HTTPException(status_code=404, detail=f"No historical data found for {symbol}")
         
         # Format response
-        return {
+        response_data = {
             "symbol": symbol,
             "name": info.get('shortName', 'Unknown'),
             "sector": info.get('sector', 'Unknown'),
@@ -484,11 +595,14 @@ def get_stock_data_endpoint(
             "interval": interval,
             "data": format_stock_data(data, info)
         }
+        
+        return response_data
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching stock data: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error while fetching stock data")
+        raise HTTPException(status_code=500, detail=f"Internal server error while fetching stock data: {str(e)}")
 
 # ✅ 4️⃣ Get Forex Data
 @app.get("/forex/{pair}")
@@ -725,10 +839,24 @@ def get_popular_indian_mutual_funds(
         logger.error(f"Error fetching popular mutual funds: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error while fetching popular mutual funds")
 
-# Run FastAPI server
+# Update the main block
 if __name__ == "__main__":
     import uvicorn
-    import os
-
-    port = int(os.environ.get("PORT", 8080))  # Use environment PORT or default to 8080
-    uvicorn.run(app, host="0.0.0.0", port=port) 
+    
+    # Get port from environment variable or use default
+    port = int(os.environ.get("PORT", 8080))
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Run the application
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,  # Disable reload in production
+        workers=1  # Adjust based on your needs
+    ) 
